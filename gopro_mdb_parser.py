@@ -302,18 +302,40 @@ SENTINEL = 0xFFFFFFFF
 NULL_MARKER = 0xFFFF
 
 # File type values (file_type_ex field)
-# Hero11+ uses different values - appears to be a bitmap/flags field
+# From dfs_file_type_e enum in GoPro firmware
 FILE_TYPES = {
-    0: "Unknown",
-    1: "Video",
-    2: "Photo",
-    3: "Timelapse",
-    4: "Burst",
-    5: "Audio",
-    # Hero11+ extended types (bit flags)
-    0x1000: "Video",            # 4096 - seen in Hero11/12 video files
-    0x1100: "Timelapse",        # Estimated
-    0x1200: "Photo",            # Estimated
+    0x0000: "None",
+    # Video types (0x1xxx)
+    0x1000: "Video",
+    0x1003: "Video 3D Right",
+    0x1005: "Video 3D Left",
+    0x1010: "Video LRV",
+    0x1020: "Video THM",
+    0x1040: "Video TRV",
+    0x1080: "Video WAV",
+    0x1100: "Video Loop",
+    0x1110: "Video Loop LRV",
+    0x1180: "Video WAV Loop",
+    0x1200: "Video Chaptered",
+    0x1210: "Video Chaptered LRV",
+    0x1280: "Video Chaptered WAV",
+    0x11000: "Video Timelapse",
+    # Photo types (0x2xxx)
+    0x2000: "Photo",
+    0x2003: "Photo 3D Right",
+    0x2005: "Photo 3D Left",
+    0x2010: "Photo DNG",
+    0x2100: "Photo Burst",
+    0x2103: "Photo Burst 3D Right",
+    0x2105: "Photo Burst 3D Left",
+    0x2400: "Photo PIV",
+    0x12100: "Photo Timelapse",
+    0x22100: "Photo Continuous",
+    0x42100: "Photo Nightlapse",
+    0x102000: "Photo Night",
+    # Other types
+    0x4000: "Metadata",
+    0x8000: "Audio",
 }
 
 
@@ -477,52 +499,34 @@ class GoproMDBParser:
             self.page_size = 512  # Default for GoPro
 
     def _parse_mco_version(self):
-        """Extract MCO eXtremeDB version from dictionary area"""
-        # Dictionary typically at 0x0C00-0x1000 region
-        # MCO version stored as: major(u8/u16), minor(u8/u16), build(u16)
+        """Extract MCO eXtremeDB version from dictionary area.
 
-        # Search for dictionary by looking for string table page (kind=4)
-        for offset in range(0x800, min(0x3000, self.file_size), self.page_size):
-            if offset < len(self.data):
-                kind = self.data[offset] & 0x0F
-                if kind == 4:  # AUTOID_HASH / string table
-                    # Dictionary is typically a few pages before string table
-                    self.dictionary_offset = max(0x0C00, offset - 0x1400)
-                    break
+        MCO version format: major(u16), minor(u16), build(u16), flags(u16)
+        Example: 07 00 01 00 01 07 09 00 = version 7.1.1793
 
-        if self.dictionary_offset == 0:
-            self.dictionary_offset = 0x0C10  # Default for GoPro
+        We search for this pattern since the dictionary offset varies:
+        - Hero8/Max: dictionary at 0x0600
+        - Hero11/12: dictionary at 0x0C00
+        """
+        # Search for MCO version pattern in likely dictionary regions
+        search_range = min(0x2000, self.file_size - 8)
 
-        # Try to extract MCO version from dictionary area
-        # Format varies: look for valid version patterns
-        dict_area = self.dictionary_offset
+        for offset in range(0x0400, search_range, 8):
+            major = self._read_u16(offset)
+            minor = self._read_u16(offset + 2)
+            build = self._read_u16(offset + 4)
 
-        # Check at 0x0C10 (common Hero11 location)
-        if self.file_size > 0x0C16:
-            v1 = self._read_u16(0x0C10)
-            v2 = self._read_u16(0x0C12)
-            v3 = self._read_u16(0x0C14)
-
-            # Valid MCO version: major 1-15, minor 0-99, build < 10000
-            if 1 <= v1 <= 15 and v2 <= 99 and v3 < 10000:
-                self.mco_version.major = v1
-                self.mco_version.minor = v2
-                self.mco_version.build = v3
-                self.dictionary_offset = 0x0C10
+            # Valid MCO version: major 5-10, minor 0-10, build 1000-3000
+            if 5 <= major <= 10 and minor <= 10 and 1000 <= build < 3000:
+                self.mco_version.major = major
+                self.mco_version.minor = minor
+                self.mco_version.build = build
+                # Dictionary starts before version (8-16 bytes typically)
+                self.dictionary_offset = offset - 8 if offset >= 8 else offset
                 return
 
-        # Alternative: search for version pattern in dictionary region
-        for offset in range(0x0C00, min(0x1000, self.file_size - 6), 2):
-            v1 = self._read_u16(offset)
-            v2 = self._read_u16(offset + 2)
-            v3 = self._read_u16(offset + 4)
-
-            if 5 <= v1 <= 10 and v2 <= 10 and 1000 <= v3 < 3000:
-                self.mco_version.major = v1
-                self.mco_version.minor = v2
-                self.mco_version.build = v3
-                self.dictionary_offset = offset
-                return
+        # Fallback: default values
+        self.dictionary_offset = 0x0C00
 
     def _find_and_parse_records(self):
         """Find and parse data records from the database"""
@@ -552,44 +556,41 @@ class GoproMDBParser:
         - Bytes 16+: Record data
 
         Table IDs: 1=mdb_global, 2=mdb_single, 3=mdb_single_ex, 4=mdb_grouped_ex
+
+        Record sizes vary by camera:
+        - Hero8/Max: mdb_single_ex=136, mdb_grouped_ex=73
+        - Hero11/12: mdb_single_ex=134, mdb_grouped_ex=73
         """
         SLOT_SIZE = 128  # Records are in 128-byte slots
 
-        # Expected sizes based on schema
-        expected_sizes = self.RECORD_SIZES.get(
-            'hero11+' if self.schema_version == 'hero11+' else 'hero5',
-            self.RECORD_SIZES['hero11+']
-        )
+        # Determine scan start based on dictionary offset
+        # Hero8/Max: dict at 0x0600, records around 0x2200
+        # Hero11/12: dict at 0x0C00, records around 0x2C00
+        scan_start = 0x1800 if self.dictionary_offset < 0x0800 else 0x2800
 
-        # Scan the data region (typically 0x2C00 onwards) in 128-byte increments
-        for slot_start in range(0x2C00, self.file_size - SLOT_SIZE, SLOT_SIZE):
+        # Scan the data region in 128-byte increments
+        for slot_start in range(scan_start, self.file_size - SLOT_SIZE, SLOT_SIZE):
             # Read slot header
             kind = self.data[slot_start] & 0x0F
             table_id = self._read_u16(slot_start + 2)
             record_size = self._read_u32(slot_start + 4)
 
             # Valid record slot: kind=0 (DATA), table_id 3 or 4, reasonable size
-            if kind == 0 and table_id in [3, 4] and 40 < record_size < 200:
-                # Check if size matches expected for this table
-                expected = expected_sizes.get(
-                    'mdb_single_ex' if table_id == 3 else 'mdb_grouped_ex', 0
+            # mdb_single_ex: 134-136 bytes, mdb_grouped_ex: 73 bytes
+            if kind == 0 and table_id in [3, 4] and 50 < record_size < 200:
+                header = RecordHeader(
+                    table_id=table_id,
+                    flags=0,
+                    size=record_size,
+                    next_ptr=0
                 )
 
-                if abs(record_size - expected) < 20:  # Allow some variance
-                    header = RecordHeader(
-                        table_id=table_id,
-                        flags=0,
-                        size=record_size,
-                        next_ptr=0
-                    )
-
-                    # Record data starts at offset 16 within slot (after header + pointer)
-                    # For mdb_single_ex, actual data starts at offset 24 (skip 8-byte padding)
-                    data_start = slot_start + 16
-                    # Read enough data for the record plus any overflow
-                    extended_end = min(slot_start + SLOT_SIZE + 64, self.file_size)
-                    record_data = self.data[data_start:extended_end]
-                    self.raw_records.append((header, record_data))
+                # Record data starts at offset 16 within slot (after header + pointer)
+                data_start = slot_start + 16
+                # Read enough data for the record plus any overflow
+                extended_end = min(slot_start + SLOT_SIZE + 64, self.file_size)
+                record_data = self.data[data_start:extended_end]
+                self.raw_records.append((header, record_data))
 
     def _parse_single_ex_data(self, data: bytes) -> Optional[MdbSingleEx]:
         """Parse mdb_single_ex record data using schema-defined offsets.
@@ -1503,10 +1504,9 @@ class DictionaryParser:
     - Field name string pool
     """
 
-    DICT_OFFSET = 0x0C00
-
-    def __init__(self, data: bytes):
+    def __init__(self, data: bytes, dict_offset: int = 0x0C00):
         self.data = data
+        self.dict_offset = dict_offset
         self.mco_version: MCOVersion = MCOVersion()
         self.classes: List[DictClassDef] = []
         self.indexes: List[DictIndexDef] = []
@@ -1549,7 +1549,7 @@ class DictionaryParser:
 
     def parse(self) -> bool:
         """Parse the dictionary structure"""
-        if len(self.data) < self.DICT_OFFSET + 0x200:
+        if len(self.data) < self.dict_offset + 0x200:
             return False
 
         # Parse header at 0x0C00
@@ -1568,7 +1568,7 @@ class DictionaryParser:
 
     def _parse_header(self):
         """Parse dictionary header"""
-        base = self.DICT_OFFSET
+        base = self.dict_offset
 
         # MCO version at offset 0x10 (0x0C10)
         self.mco_version.major = self._read_u16(base + 0x10)
@@ -1587,7 +1587,7 @@ class DictionaryParser:
 
     def _parse_classes(self):
         """Parse class table starting at 0x0CA0"""
-        base = self.DICT_OFFSET
+        base = self.dict_offset
 
         # Class pointers at 0xA0 (0x0CA0)
         ptr_offset = base + 0xA0
@@ -1957,7 +1957,7 @@ def main():
         print(parser.to_json())
 
     elif args.dict:
-        dict_parser = DictionaryParser(parser.data)
+        dict_parser = DictionaryParser(parser.data, parser.dictionary_offset)
         if dict_parser.parse():
             dict_parser.print_summary()
         else:
