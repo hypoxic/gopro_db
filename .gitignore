@@ -1,0 +1,17 @@
+# macOS
+.DS_Store
+
+# Claude Code
+.claude/
+
+# User data
+volume/
+
+# Reverse engineering files
+hero11_mco/
+mco_dump/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
