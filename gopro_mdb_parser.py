@@ -311,9 +311,9 @@ FILE_TYPES = {
     4: "Burst",
     5: "Audio",
     # Hero11+ extended types (bit flags)
-    0x1000: "Video (H11)",      # 4096 - seen in Hero11 video files
-    0x1100: "Timelapse (H11)",  # Estimated
-    0x1200: "Photo (H11)",      # Estimated
+    0x1000: "Video",            # 4096 - seen in Hero11/12 video files
+    0x1100: "Timelapse",        # Estimated
+    0x1200: "Photo",            # Estimated
 }
 
 
